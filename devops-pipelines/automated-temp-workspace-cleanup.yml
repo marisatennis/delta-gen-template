@@ -1,0 +1,231 @@
+# Automated Temporary Workspace Cleanup Pipeline
+# Purpose: Monthly scheduled cleanup of unused temporary workspaces
+# Runs: First day of every month at 2 AM UTC
+# Target: Workspaces starting with "temp-" that haven't been used in 30+ days
+
+trigger: none
+pr: none
+
+# Schedule: Run on the 1st of every month at 2 AM UTC
+schedules:
+  - cron: "0 2 1 * *"
+    displayName: Monthly cleanup of unused temp workspaces
+    branches:
+      include:
+        - main
+    always: true  # Run even if there are no code changes
+
+pool:
+  vmImage: "ubuntu-latest"
+
+parameters:
+  - name: dryRun
+    type: boolean
+    displayName: "Dry Run (list workspaces without deleting)"
+    default: true
+
+  - name: inactivityDays
+    type: number
+    displayName: "Delete workspaces inactive for X days"
+    default: 30
+
+variables:
+  - name: serviceConnection
+    value: "svc-azure-terraform-001"
+  - name: WORKSPACE_PREFIX
+    value: "temp"
+
+stages:
+  - stage: DiscoverWorkspaces
+    displayName: "Discover Temporary Workspaces"
+    jobs:
+      - job: ListWorkspaces
+        displayName: List all temp workspaces
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Find all temp-* workspaces
+            name: DiscoverStep
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                # Source the reusable functions
+                chmod +x devops-pipelines/templates/scripts/delete-workspaces.sh
+                source devops-pipelines/templates/scripts/delete-workspaces.sh
+
+                ACCESS_TOKEN=$(get_access_token)
+
+                echo "============================================"
+                echo "Temporary Workspace Cleanup - Discovery"
+                echo "============================================"
+                echo "Prefix filter: $(WORKSPACE_PREFIX)-"
+                echo "Inactivity threshold: ${{ parameters.inactivityDays }} days"
+                echo "Dry run: ${{ parameters.dryRun }}"
+                echo ""
+
+                # Discover inactive workspaces - output goes to stderr, JSON to stdout
+                DELETE_LIST=$(discover_inactive_workspaces "$ACCESS_TOKEN" "$(WORKSPACE_PREFIX)-" "${{ parameters.inactivityDays }}")
+
+                # Validate JSON is not empty
+                if [ -z "$DELETE_LIST" ]; then
+                  echo "ERROR: DELETE_LIST is empty"
+                  DELETE_LIST="[]"
+                fi
+
+                DELETED_COUNT=$(echo "$DELETE_LIST" | jq 'length' || echo "0")
+
+                echo "DEBUG: DELETE_LIST length: $DELETED_COUNT"
+                echo "DEBUG: DELETE_LIST (first 200 chars): ${DELETE_LIST:0:200}"
+
+                # Base64 encode to safely transfer JSON through pipeline variables
+                DELETE_LIST_B64=$(echo "$DELETE_LIST" | base64 -w 0 2>/dev/null || echo "$DELETE_LIST" | base64)
+
+                echo "DEBUG: Base64 encoded length: ${#DELETE_LIST_B64}"
+
+                # Output the list as a pipeline variable
+                echo "##vso[task.setvariable variable=WORKSPACES_TO_DELETE;isOutput=true]$DELETE_LIST_B64"
+                echo "##vso[task.setvariable variable=DELETE_COUNT;isOutput=true]$DELETED_COUNT"
+
+  - stage: ReviewWorkspaces
+    dependsOn: DiscoverWorkspaces
+    displayName: "Review Workspaces for Deletion"
+    variables:
+      WORKSPACES_TO_DELETE: $[ stageDependencies.DiscoverWorkspaces.ListWorkspaces.outputs['DiscoverStep.WORKSPACES_TO_DELETE'] ]
+      DELETE_COUNT: $[ stageDependencies.DiscoverWorkspaces.ListWorkspaces.outputs['DiscoverStep.DELETE_COUNT'] ]
+    jobs:
+      - job: ReviewList
+        displayName: Review deletion candidates
+        steps:
+          - script: |
+              echo "============================================"
+              echo "Workspaces Marked for Deletion"
+              echo "============================================"
+              echo ""
+
+              echo "DEBUG: Raw WORKSPACES_TO_DELETE length: ${#WORKSPACES_TO_DELETE}"
+              echo "DEBUG: Raw WORKSPACES_TO_DELETE (first 100 chars): $(echo '$(WORKSPACES_TO_DELETE)' | head -c 100)"
+
+              # Decode base64-encoded JSON
+              WORKSPACES_JSON=$(echo '$(WORKSPACES_TO_DELETE)' | base64 -d 2>/dev/null || echo '[]')
+
+              echo "DEBUG: Decoded JSON length: ${#WORKSPACES_JSON}"
+              echo "DEBUG: Decoded JSON (first 200 chars): ${WORKSPACES_JSON:0:200}"
+
+              # Validate JSON is not empty
+              if [ -z "$WORKSPACES_JSON" ] || [ "$WORKSPACES_JSON" = "null" ]; then
+                echo "No workspaces to delete. All temp workspaces are active!"
+                exit 0
+              fi
+
+              DELETE_COUNT=$(echo "$WORKSPACES_JSON" | jq 'length' 2>/dev/null || echo "0")
+
+              if [ "$DELETE_COUNT" -eq 0 ]; then
+                echo "No workspaces to delete. All temp workspaces are active!"
+                exit 0
+              fi
+
+              echo "The following $DELETE_COUNT workspace(s) will be deleted:"
+              echo ""
+              echo "$WORKSPACES_JSON" | jq -r '.[] | "  • \(.name) - \(.reason)"'
+              echo ""
+
+              if [ "${{ parameters.dryRun }}" == "True" ]; then
+                echo "============================================"
+                echo "DRY RUN MODE - No deletions will occur"
+                echo "Set dryRun=false to perform actual deletion"
+                echo "============================================"
+              else
+                echo "============================================"
+                echo "⚠️  DELETION WILL PROCEED IN NEXT STAGE"
+                echo "============================================"
+              fi
+            displayName: "Display deletion list"
+
+  - stage: DeleteWorkspaces
+    dependsOn:
+      - DiscoverWorkspaces
+      - ReviewWorkspaces
+    displayName: "Delete Inactive Workspaces"
+    condition: and(succeeded(), eq('${{ parameters.dryRun }}', false))
+    variables:
+      WORKSPACES_TO_DELETE: $[ stageDependencies.DiscoverWorkspaces.ListWorkspaces.outputs['DiscoverStep.WORKSPACES_TO_DELETE'] ]
+    jobs:
+      - job: PerformDeletion
+        displayName: Delete workspaces
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Delete inactive workspaces
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                # Source the reusable functions
+                chmod +x devops-pipelines/templates/scripts/delete-workspaces.sh
+                source devops-pipelines/templates/scripts/delete-workspaces.sh
+
+                ACCESS_TOKEN=$(get_access_token)
+
+                echo "============================================"
+                echo "Deleting Inactive Workspaces"
+                echo "============================================"
+                echo ""
+
+                # Decode base64-encoded JSON
+                DELETE_LIST=$(echo '$(WORKSPACES_TO_DELETE)' | base64 -d 2>/dev/null || echo '[]')
+
+                if [ -z "$DELETE_LIST" ] || [ "$DELETE_LIST" = "null" ]; then
+                  echo "No workspaces to delete."
+                  exit 0
+                fi
+
+                delete_workspaces_from_json "$ACCESS_TOKEN" "$DELETE_LIST"
+
+  - stage: NotifyResults
+    dependsOn:
+      - DiscoverWorkspaces
+      - DeleteWorkspaces
+    displayName: "Cleanup Summary"
+    condition: always()
+    variables:
+      DELETE_COUNT: $[ stageDependencies.DiscoverWorkspaces.ListWorkspaces.outputs['DiscoverStep.DELETE_COUNT'] ]
+    jobs:
+      - job: SendNotification
+        displayName: Log cleanup results
+        steps:
+          - script: |
+              echo "============================================"
+              echo "Automated Temporary Workspace Cleanup"
+              echo "============================================"
+              echo ""
+              echo "Execution Date: $(date)"
+              echo "Dry Run Mode: ${{ parameters.dryRun }}"
+              echo "Inactivity Threshold: ${{ parameters.inactivityDays }} days"
+              echo ""
+              echo "Workspaces identified for cleanup: $(DELETE_COUNT)"
+              echo ""
+
+              if [ "${{ parameters.dryRun }}" == "True" ]; then
+                echo "ℹ️  This was a DRY RUN - no workspaces were deleted"
+                echo "   Review the logs above to see what would be deleted"
+                echo "   Set dryRun=false to perform actual deletion"
+              else
+                echo "✅ Cleanup operation completed"
+                echo "   Check DeleteWorkspaces stage for detailed results"
+              fi
+              echo ""
+              echo "Next scheduled run: 1st of next month at 2 AM UTC"
+              echo "============================================"
+            displayName: "Display final summary"
+
+          # Optional: Add email notification or Teams webhook here
+          # - task: EmailReport@1 or similar

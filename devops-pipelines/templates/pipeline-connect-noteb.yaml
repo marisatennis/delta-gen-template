@@ -1,0 +1,28 @@
+# -----------------------------------------
+# Child template — Repoint Data Pipeline notebook references
+# -----------------------------------------
+parameters:
+  - name: pipelines
+    type: object
+    default: [] # Each entry: { workspace, pipeline, mappings: ["Activity=ws/notebook", ...] }
+
+jobs:
+  - job: ConnectPipelineNotebooks
+    displayName: Connect Pipeline Notebook References
+    steps:
+      - checkout: self
+
+      - ${{ each p in parameters.pipelines }}:
+          - task: AzureCLI@2
+            displayName: "Repoint pipeline: ${{ p.pipeline }} in ${{ p.workspace }}"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/connect-pipelines.sh
+                source devops-pipelines/templates/scripts/connect-pipelines.sh
+                fabric_connect_pipeline_notebooks \
+                  "${{ p.workspace }}" "${{ p.pipeline }}" \
+                  ${{ join(' ', p.mappings) }}

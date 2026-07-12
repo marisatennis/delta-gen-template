@@ -1,0 +1,28 @@
+# -----------------------------------------
+# Child template — expects an object list
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+
+jobs:
+  - job: ConnectNotebooksToLakehouses
+    displayName: Connect Notebooks To Lakehouses
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: "Connect Notebooks To ${{ ws.name }} Lakehouses"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/connect-notebooks.sh
+                source devops-pipelines/templates/scripts/connect-notebooks.sh
+                echo "[INFO] Connecting notebooks to lakehouses and environments via REST API"
+                fabric_connect_notebooks_to_lakehouse_api "${{ ws.name }}" "${{ ws.lakehouse }}"

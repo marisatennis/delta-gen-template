@@ -1,0 +1,31 @@
+# Purview Governance Configuration
+# Customize this file for your project
+
+purview:
+  # Account name (or set PURVIEW_ACCOUNT_NAME env var)
+  account_name: ${PURVIEW_ACCOUNT_NAME}
+  tenant_id: ${PURVIEW_TENANT_ID}
+
+  # Collection hierarchy in Purview
+  collections:
+    root: "Data Platform"
+    layers:
+      bronze: "Bronze Layer"
+      silver: "Silver Layer"
+      gold: "Gold Layer"
+      log: "Logging & Metrics"
+
+  # Custom type prefix for Fabric Lakehouse entities
+  type_prefix: "fabric_lakehouse"
+
+  # Map YAML extensions.classification to Purview classification types
+  classifications:
+    PII: "MICROSOFT.PERSONAL.ALL"
+    financial: "MICROSOFT.FINANCIAL.ALL"
+    confidential: "MICROSOFT.GENERAL.CONFIDENTIAL"
+    internal: "MICROSOFT.GENERAL.INTERNAL"
+
+  # Lineage settings
+  lineage:
+    include_generated_sources: false
+    process_type: "Process"

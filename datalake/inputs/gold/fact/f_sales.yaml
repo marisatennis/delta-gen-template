@@ -1,0 +1,146 @@
+# Example Gold Fact Table
+# This template shows common patterns for fact tables.
+
+name: f_sales
+layer: gold
+target_schema: fact
+description: "Sales transactions fact table"
+
+policies:
+  orchestration:
+    active: true
+    batch: 2
+    order: 10
+  creation:
+    notebook_name: gold-template
+  optimisation:
+    load_mode: merge
+    merge_strategy: update_changed
+
+natural_key:
+  - SalesNaturalID
+
+sources:
+  - name: src
+    table: silver.sales_transactions
+
+  - name: d_date
+    table: dimension.d_date
+    broadcast: true
+
+  - name: d_product
+    table: dimension.d_product
+    broadcast: true
+
+  - name: d_customer
+    table: dimension.d_customer
+    broadcast: true
+
+incremental:
+  filter_mode: watermark
+  watermark_column: DateNaturalID
+  source_watermark_column: transaction_date
+
+columns:
+  - name: SalesNaturalID
+    data_type: string
+    nullable: false
+    inputs:
+      - source: src
+        column: transaction_id
+
+  - name: FK_DateID
+    data_type: string
+    nullable: false
+    default: "NO_DATE"
+    inputs:
+      - expression: "COALESCE(d_date.DateID, 'NO_DATE')"
+
+  - name: FK_ProductID
+    data_type: string
+    nullable: false
+    default: "NO_PRODUCT"
+    inputs:
+      - expression: "COALESCE(d_product.ProductID, 'NO_PRODUCT')"
+
+  - name: FK_CustomerID
+    data_type: string
+    nullable: false
+    default: "NO_CUSTOMER"
+    inputs:
+      - expression: "COALESCE(d_customer.CustomerID, 'NO_CUSTOMER')"
+
+  - name: DateNaturalID
+    data_type: string
+    nullable: false
+    inputs:
+      - source: src
+        column: transaction_date
+
+  - name: Quantity
+    data_type: int
+    nullable: false
+    default: 0
+    inputs:
+      - source: src
+        column: quantity
+
+  - name: UnitPrice
+    data_type: decimal
+    nullable: false
+    default: 0.0
+    inputs:
+      - source: src
+        column: unit_price
+
+  - name: TotalAmount
+    data_type: decimal
+    nullable: false
+    default: 0.0
+    inputs:
+      - expression: "src.quantity * src.unit_price"
+
+  - name: source_modified
+    data_type: date
+    nullable: false
+    default: ${defaults.columns.default_date}
+    inputs:
+      - source: src
+        column: modified_date
+
+stages:
+  - name: join_dimensions
+    type: transformation
+    joins:
+      - source: d_date
+        type: left
+        conditions:
+          - left: DateNaturalID
+            right: DateNaturalID
+
+      - source: d_product
+        type: left
+        conditions:
+          - left_source: src
+            left_column: product_code
+            right: ProductNaturalID
+
+      - source: d_customer
+        type: left
+        conditions:
+          - left_source: src
+            left_column: customer_id
+            right: CustomerNaturalID
+
+  - name: check_unresolved_fks
+    extensions:
+      stage_plugin: check_unresolved_fks
+      summary_table: ${defaults.dq.unresolved_fks_table}
+      records_table: ${defaults.dq.unresolved_records_table}
+      checks:
+        - column: FK_DateID
+          sentinel: NO_DATE
+        - column: FK_ProductID
+          sentinel: NO_PRODUCT
+        - column: FK_CustomerID
+          sentinel: NO_CUSTOMER

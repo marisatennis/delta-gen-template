@@ -1,0 +1,14 @@
+[
+  {
+    "name": "TFSL-Ingress",
+    "path": "/Files/sources",
+    "target": {
+      "type": "AdlsGen2",
+      "adlsGen2": {
+        "connectionId": "2b61fd9d-e011-4bdf-bbbc-c2fe1f610feb",
+        "location": "https://adlsprodsftp001.dfs.core.windows.net",
+        "subpath": "/tfsl-ingress"
+      }
+    }
+  }
+]

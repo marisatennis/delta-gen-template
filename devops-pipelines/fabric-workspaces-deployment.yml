@@ -1,0 +1,512 @@
+# Parent pipeline — drives environment selection and workspace list construction
+
+trigger:
+  batch: true
+  branches:
+    include: [main, test, prod]
+  paths:
+    exclude:
+      - docs/**
+      - design/**
+      - "*.md"
+      - ".gitignore"
+
+pr: none
+
+pool:
+  vmImage: "ubuntu-latest"
+
+parameters:
+  - name: environment
+    type: string
+    displayName: "Target environment (used for manual runs)"
+    default: nonprod
+    values:
+      - nonprod
+      - prod
+
+variables:
+  - name: serviceConnection
+    value: "svc-azure-terraform-001"
+  - group: vg-platform-global
+  - group: vg-platform-nonprod
+  - group: vg-platform-prod
+
+stages:
+  - stage: derive_context
+    displayName: "Derive environment context (from branch)"
+    jobs:
+      - job: derive
+        displayName: Determine ENV_PREFIX & workspace names
+        steps:
+          - script: |
+              echo "##vso[task.setvariable variable=ENV_PREFIX;isOutput=true]$(Build.SourceBranchName)"
+            name: DeriveStep
+
+  - stage: CreateWorkspace
+    dependsOn: derive_context
+    displayName: "Configure & Sync Workspaces"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/create-workspace.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+            - name: "$(ENV_PREFIX)-log"
+            - name: "$(ENV_PREFIX)-reporting"
+
+      - job: CreateAppWorkspaces
+        displayName: "Create App Workspaces (from apps.yaml)"
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Create App Workspaces"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                source devops-pipelines/templates/scripts/deploy-apps.sh
+                apps_create_workspaces "$(ENV_PREFIX)" "all" "platform/apps"
+
+      - job: WaitAfterWorkspace
+        displayName: "Pause for 10 seconds"
+        pool: server # agentless
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "10"
+
+  - stage: AssignCapacity
+    dependsOn:
+      - derive_context
+      - CreateWorkspace
+    displayName: "Assign Capacity to Workspaces"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/assign-capacity.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+            - name: "$(ENV_PREFIX)-log"
+            - name: "$(ENV_PREFIX)-reporting"
+          CapacityIdNonProd: $(capacity_Id_nonprod)
+          CapacityIdProd: $(capacity_Id_prod)
+
+      - job: AssignCapacityToApps
+        displayName: "Assign Capacity to App Workspaces"
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Assign Capacity to Apps"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                source devops-pipelines/templates/scripts/deploy-apps.sh
+                # Use nonprod capacity for non-prod, prod for prod
+                BRANCH="$(Build.SourceBranchName)"
+                if [[ "$BRANCH" == "prod" ]]; then
+                  CAPACITY="$(capacity_Id_prod)"
+                else
+                  CAPACITY="$(capacity_Id_nonprod)"
+                fi
+                apps_assign_capacity "$(ENV_PREFIX)" "all" "platform/apps" "$CAPACITY"
+
+      - job: WaitAfterWorkspace
+        displayName: "Pause for 10 seconds"
+        pool: server # agentless
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "10"
+
+  - stage: AddUsersToWorkspace
+    dependsOn:
+      - derive_context
+      - AssignCapacity
+    displayName: "Add Users to Workspaces"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/add-users.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+            - name: "$(ENV_PREFIX)-log"
+            - name: "$(ENV_PREFIX)-reporting"
+          devgroup: $(dev_group)
+          admingroup: $(admin_group)
+
+      - job: AddUsersToApps
+        displayName: "Add Users to App Workspaces"
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Add Users to Apps"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                source devops-pipelines/templates/scripts/deploy-apps.sh
+                apps_add_users "$(ENV_PREFIX)" "all" "platform/apps" "$(dev_group)" "$(admin_group)"
+
+  - stage: GitConnect
+    dependsOn:
+      - derive_context
+      - AddUsersToWorkspace
+    displayName: "Git Connect Workspaces"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/git-connect.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+            - name: "$(ENV_PREFIX)-log"
+            - name: "$(ENV_PREFIX)-reporting"
+
+      - job: GitConnectApps
+        displayName: "Git Connect App Workspaces"
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Git Connect Apps"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                ORG_URL="$(System.TeamFoundationCollectionUri)"
+                ORG_NAME="$(echo "$ORG_URL" | awk -F'/' '{print $4}')"
+
+                chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                source devops-pipelines/templates/scripts/deploy-apps.sh
+                apps_git_connect "$(ENV_PREFIX)" "all" "platform/apps" \
+                  "$(Build.SourceBranchName)" \
+                  "$ORG_NAME" "$(System.TeamProject)" "$(Build.Repository.Name)" \
+                  "ADO-SourceControl-SP" "$(tenantId)" "$(servicePrincipalId)" "$(client_secret)"
+
+      - job: WaitAfterGitConnect
+        dependsOn:
+          - GitConnectToWorkspaces
+          - GitConnectApps
+        displayName: "Pause for 15 seconds"
+        pool: server # agentless
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "15"
+
+  - stage: GitSync
+    dependsOn:
+      - derive_context
+      - GitConnect
+    displayName: "Git Sync to Workspaces"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/git-sync.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+            - name: "$(ENV_PREFIX)-log"
+            - name: "$(ENV_PREFIX)-reporting"
+
+      - job: GitSyncApps
+        displayName: "Git Sync App Workspaces"
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Git Sync Apps"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                source devops-pipelines/templates/scripts/deploy-apps.sh
+                apps_git_sync "$(ENV_PREFIX)" "all" "platform/apps"
+
+      - job: WaitAfterGitSync
+        dependsOn:
+          - GitSyncWorkspaces
+          - GitSyncApps
+        displayName: "Pause for 30 seconds"
+        pool: server # agentless
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "30"
+
+  # These three stages run in PARALLEL after GitSync
+  - stage: PublishEnvironments
+    dependsOn:
+      - derive_context
+      - GitSync
+    displayName: "Publish Fabric Environments"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/publish-environments.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+
+  - stage: CopyFilesToLakehouses
+    dependsOn:
+      - derive_context
+      - GitSync
+    displayName: "Copy Files to Workspaces"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/copyfiles-lakehouse.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+          tenantId: $(tenantId)
+
+  - stage: ApplyShortcuts
+    dependsOn:
+      - derive_context
+      - GitSync
+    displayName: "Apply OneLake Shortcuts (Bronze)"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/apply-shortcuts.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+          shortcutsFile: "datalake/inputs/config/shortcuts-bronze.yaml"
+
+  - stage: RepointLakehouseShortcuts
+    dependsOn:
+      - derive_context
+      - GitSync
+    displayName: "Repoint OneLake Shortcuts (Silver/Gold/Log)"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/update-shortcuts.yaml
+        parameters:
+          mappings:
+            - targetWorkspace: "$(ENV_PREFIX)-silver"
+              targetLakehouse: "silver"
+              sourceWorkspace: "$(ENV_PREFIX)-bronze"
+              sourceLakehouse: "bronze"
+            - targetWorkspace: "$(ENV_PREFIX)-gold"
+              targetLakehouse: "gold"
+              sourceWorkspace: "$(ENV_PREFIX)-silver"
+              sourceLakehouse: "silver"
+            - targetWorkspace: "$(ENV_PREFIX)-log"
+              targetLakehouse: "observability"
+              sourceWorkspace: "$(ENV_PREFIX)-silver"
+              sourceLakehouse: "silver"
+              shortcutName: "silver_log"
+            - targetWorkspace: "$(ENV_PREFIX)-log"
+              targetLakehouse: "observability"
+              sourceWorkspace: "$(ENV_PREFIX)-gold"
+              sourceLakehouse: "gold"
+              shortcutName: "gold_log"
+            - targetWorkspace: "$(ENV_PREFIX)-log"
+              targetLakehouse: "observability"
+              sourceWorkspace: "$(ENV_PREFIX)-bronze"
+              sourceLakehouse: "bronze"
+              shortcutName: "bronze_control"
+
+  # Batch 2: Connect notebooks/models and commit to git (runs in PARALLEL with Batch 1)
+  # These stages are sequential within the batch
+  - stage: ConnectLakehouseToNotebooks
+    dependsOn:
+      - derive_context
+      - GitSync
+    displayName: "Connect Lakehouse To Notebooks"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/lakehouse-connect-noteb.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+              lakehouse: "bronze"
+            - name: "$(ENV_PREFIX)-silver"
+              lakehouse: "silver"
+            - name: "$(ENV_PREFIX)-gold"
+              lakehouse: "gold"
+            - name: "$(ENV_PREFIX)-log"
+              lakehouse: "observability"
+
+  - stage: ConnectSemanticModels
+    dependsOn:
+      - derive_context
+      - ConnectLakehouseToNotebooks
+    displayName: "Connect Semantic Models to SQL Endpoints"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/connect-semantic-models.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-gold"
+              lakehouse: "gold"
+            - name: "$(ENV_PREFIX)-log"
+              lakehouse: "observability"
+            - name: "$(ENV_PREFIX)-reporting"
+              lakehouse: "gold"
+              lakehouseWorkspace: "$(ENV_PREFIX)-gold"
+
+  - stage: ConnectPipelineNotebooks
+    dependsOn:
+      - derive_context
+      - ConnectLakehouseToNotebooks
+    displayName: "Repoint Pipeline Notebook References"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/pipeline-connect-noteb.yaml
+        parameters:
+          pipelines:
+            - workspace: "$(ENV_PREFIX)-log"
+              pipeline: "orchestrator"
+              mappings:
+                - "Bronze=$(ENV_PREFIX)-bronze/bronze-orchestrator"
+                - "Silver=$(ENV_PREFIX)-silver/silver-orchestrator"
+                - "Gold=$(ENV_PREFIX)-gold/gold-orchestrator"
+
+  - stage: RebindReports
+    dependsOn:
+      - derive_context
+      - ConnectSemanticModels
+    displayName: "Rebind Reports to Semantic Models"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - job: RebindAppReports
+        displayName: "Rebind App Reports (from apps.yaml)"
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Rebind Reports"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                source devops-pipelines/templates/scripts/deploy-apps.sh
+                apps_rebind_reports "$(ENV_PREFIX)" "all" "platform/apps"
+
+  - stage: GitUpdateWorkspace
+    dependsOn:
+      - derive_context
+      - PublishEnvironments
+      - CopyFilesToLakehouses
+      - ApplyShortcuts
+      - RepointLakehouseShortcuts
+      - ConnectLakehouseToNotebooks
+      - ConnectSemanticModels
+      - ConnectPipelineNotebooks
+      - RebindReports
+    condition: succeededOrFailed()
+    displayName: "Git Update (Pull from Remote)"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/git-sync.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+            - name: "$(ENV_PREFIX)-log"
+            - name: "$(ENV_PREFIX)-reporting"
+
+      - job: GitUpdateApps
+        displayName: "Git Update App Workspaces"
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Git Update Apps"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                source devops-pipelines/templates/scripts/deploy-apps.sh
+                apps_git_sync "$(ENV_PREFIX)" "all" "platform/apps"
+
+      - job: WaitAfterGitUpdate
+        dependsOn:
+          - GitSyncWorkspaces
+          - GitUpdateApps
+        displayName: "Pause for 30 seconds"
+        pool: server
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "30"
+
+  - stage: GitCommitWorkspace
+    dependsOn:
+      - derive_context
+      - GitUpdateWorkspace
+    condition: succeededOrFailed()
+    displayName: "Git Commit To Remote"
+    variables:
+      ENV_PREFIX: $[ stageDependencies.derive_context.derive.outputs['DeriveStep.ENV_PREFIX'] ]
+    jobs:
+      - template: templates/git-commit.yaml
+        parameters:
+          workspaces:
+            - name: "$(ENV_PREFIX)-bronze"
+            - name: "$(ENV_PREFIX)-silver"
+            - name: "$(ENV_PREFIX)-gold"
+            - name: "$(ENV_PREFIX)-log"
+            - name: "$(ENV_PREFIX)-reporting"
+
+      - job: GitCommitApps
+        displayName: "Git Commit App Workspaces"
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: "Git Commit Apps"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                source devops-pipelines/templates/scripts/deploy-apps.sh
+                apps_git_commit "$(ENV_PREFIX)" "all" "platform/apps"

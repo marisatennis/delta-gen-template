@@ -1,0 +1,48 @@
+# Create png from .drawio files 
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- checkout:  self
+  persistCredentials: true
+
+- task: CmdLine@2
+  displayName: Drawio
+  inputs:
+    script: >+
+      docker pull rlespinasse/drawio-export
+
+      cd $(agent.builddirectory)/s/
+
+      changed_files=$(git diff --name-only HEAD~1 -- '*.drawio')
+
+      if [ -z "$changed_files" ]; then
+          echo "No .drawio files changed, skipping export"
+      else
+          echo "$changed_files" | while read -r file; do
+              echo "Exporting $file"
+              docker run -v $(pwd):/data rlespinasse/drawio-export -f "png" --output "pngs" --remove-page-suffix "$file"
+          done
+      fi
+      
+      replace="refs/heads/"
+
+      branch="${SYSTEM_PULLREQUEST_SOURCEBRANCH/${replace}/}"
+      
+      echo "Pushing Changes to remote branch $branch"
+      
+      git status
+
+      git checkout -b$branch
+      
+      git config --global user.email "BI-Azure@bot.com"
+
+      git config --global user.name "BI Azure Bot"
+
+      git add .
+
+      git commit -m"export drawio files into pngs"
+      
+      git push origin $branch --force

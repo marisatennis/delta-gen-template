@@ -1,0 +1,4 @@
+azure-identity>=1.15.0
+azure-purview-catalog>=1.0.0b4
+pyyaml>=6.0
+requests>=2.31.0

@@ -1,0 +1,203 @@
+# Developer Workspace Cleanup Pipeline
+# Purpose: Allow developers to delete their temporary workspaces when done with feature development
+# Naming pattern: temp-{layer}-{dev-suffix}
+
+trigger: none  # Manual trigger only
+pr: none
+
+pool:
+  vmImage: "ubuntu-latest"
+
+parameters:
+  - name: devSuffix
+    type: string
+    displayName: "Developer/Feature Name (suffix) to delete"
+    default: ""
+
+  - name: deleteBronze
+    type: boolean
+    displayName: "Delete Bronze workspace"
+    default: true
+
+  - name: deleteSilver
+    type: boolean
+    displayName: "Delete Silver workspace"
+    default: true
+
+  - name: deleteGold
+    type: boolean
+    displayName: "Delete Gold workspace"
+    default: true
+
+  - name: deleteLog
+    type: boolean
+    displayName: "Delete Log (Observability) workspace"
+    default: false
+
+  - name: confirmDeletion
+    type: boolean
+    displayName: "I confirm I want to DELETE these workspaces (this cannot be undone)"
+    default: false
+
+variables:
+  - name: serviceConnection
+    value: "svc-azure-terraform-001"
+  - name: WORKSPACE_PREFIX
+    value: "temp"
+
+stages:
+  - stage: ValidateInputs
+    displayName: "Validate Inputs and List Workspaces"
+    jobs:
+      - job: validate
+        displayName: Validate parameters and build workspace list
+        steps:
+          - script: |
+              if [ -z "${{ parameters.devSuffix }}" ]; then
+                echo "##vso[task.logissue type=error]Developer/Feature suffix cannot be empty"
+                exit 1
+              fi
+
+              # Check if confirmation is provided
+              if [ "${{ parameters.confirmDeletion }}" != "True" ]; then
+                echo "##vso[task.logissue type=error]Deletion not confirmed. Please check the confirmation box to proceed."
+                exit 1
+              fi
+
+              # Build workspace list based on selected layers
+              WORKSPACES=""
+
+              if [ "${{ parameters.deleteBronze }}" == "True" ]; then
+                WORKSPACES="$WORKSPACES bronze"
+              fi
+
+              if [ "${{ parameters.deleteSilver }}" == "True" ]; then
+                WORKSPACES="$WORKSPACES silver"
+              fi
+
+              if [ "${{ parameters.deleteGold }}" == "True" ]; then
+                WORKSPACES="$WORKSPACES gold"
+              fi
+
+              if [ "${{ parameters.deleteLog }}" == "True" ]; then
+                WORKSPACES="$WORKSPACES log"
+              fi
+
+              # Check if at least one layer is selected
+              if [ -z "$WORKSPACES" ]; then
+                echo "##vso[task.logissue type=error]At least one layer must be selected for deletion"
+                exit 1
+              fi
+
+              echo "⚠️  WARNING: This will DELETE the following workspaces:"
+              for layer in $WORKSPACES; do
+                echo "  - $(WORKSPACE_PREFIX)-${layer}-${{ parameters.devSuffix }}"
+              done
+              echo ""
+              echo "⚠️  THIS ACTION CANNOT BE UNDONE!"
+              echo ""
+              echo "Validation passed. Proceeding to deletion stage..."
+
+              # Export workspace list for use in later stages
+              echo "##vso[task.setvariable variable=WORKSPACE_LAYERS;isOutput=true]$WORKSPACES"
+            name: ValidateStep
+            displayName: "Validate inputs and warn user"
+
+  - stage: ListWorkspaces
+    dependsOn: ValidateInputs
+    displayName: "List Workspaces to be Deleted"
+    variables:
+      WORKSPACE_LAYERS: $[ stageDependencies.ValidateInputs.validate.outputs['ValidateStep.WORKSPACE_LAYERS'] ]
+    jobs:
+      - job: ListWorkspaces
+        displayName: List matching workspaces
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: List workspaces matching pattern
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                # Source the reusable functions
+                chmod +x devops-pipelines/templates/scripts/delete-workspaces.sh
+                source devops-pipelines/templates/scripts/delete-workspaces.sh
+
+                ACCESS_TOKEN=$(get_access_token)
+
+                # Build workspace names array
+                WORKSPACE_NAMES=()
+                for layer in $(WORKSPACE_LAYERS); do
+                  WORKSPACE_NAMES+=("$(WORKSPACE_PREFIX)-${layer}-${{ parameters.devSuffix }}")
+                done
+
+                list_matching_workspaces "$ACCESS_TOKEN" "${WORKSPACE_NAMES[@]}"
+
+  - stage: DeleteWorkspaces
+    dependsOn:
+      - ValidateInputs
+      - ListWorkspaces
+    displayName: "Delete Developer Workspaces"
+    variables:
+      WORKSPACE_LAYERS: $[ stageDependencies.ValidateInputs.validate.outputs['ValidateStep.WORKSPACE_LAYERS'] ]
+    jobs:
+      - job: DeleteWorkspaces
+        displayName: Delete Workspaces
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Delete all selected workspaces
+            continueOnError: true
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                # Source the reusable functions
+                chmod +x devops-pipelines/templates/scripts/delete-workspaces.sh
+                source devops-pipelines/templates/scripts/delete-workspaces.sh
+
+                ACCESS_TOKEN=$(get_access_token)
+
+                # Build workspace names array
+                WORKSPACE_NAMES=()
+                for layer in $(WORKSPACE_LAYERS); do
+                  WORKSPACE_NAMES+=("$(WORKSPACE_PREFIX)-${layer}-${{ parameters.devSuffix }}")
+                done
+
+                delete_workspaces_by_names "$ACCESS_TOKEN" "${WORKSPACE_NAMES[@]}"
+
+  - stage: Summary
+    dependsOn:
+      - ValidateInputs
+      - DeleteWorkspaces
+    displayName: "Cleanup Summary"
+    condition: always()
+    variables:
+      WORKSPACE_LAYERS: $[ stageDependencies.ValidateInputs.validate.outputs['ValidateStep.WORKSPACE_LAYERS'] ]
+    jobs:
+      - job: PrintSummary
+        displayName: Print Cleanup Summary
+        steps:
+          - script: |
+              echo "============================================"
+              echo "Developer Workspace Cleanup Complete!"
+              echo "============================================"
+              echo ""
+              echo "Processed workspaces for: ${{ parameters.devSuffix }}"
+              echo ""
+              echo "Deletion requests sent for:"
+              for layer in $(WORKSPACE_LAYERS); do
+                echo "  • $(WORKSPACE_PREFIX)-${layer}-${{ parameters.devSuffix }}"
+              done
+              echo ""
+              echo "Check the logs above for detailed status of each deletion."
+              echo "============================================"
+            displayName: "Display summary"

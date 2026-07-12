@@ -1,0 +1,44 @@
+# -----------------------------------------
+# Child template — expects an object list
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+  - name: devgroup
+  - name: admingroup
+
+jobs:
+  - job: AddUsersToWorkspaces
+    displayName: Add Users To Workspaces
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: "Add users to ${{ ws.name }} workspace"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/adduser.sh
+                source devops-pipelines/templates/scripts/adduser.sh
+                WS_NAME="${WS_NAME:-"${{ ws.name }}"}"
+                env_prefix="${WS_NAME%%-*}"      # bash parameter expansion (robust, fast)
+                env_prefix="${env_prefix,,}"     # lowercase just in case
+                env_prefix="${env_prefix//[[:space:]]/}"  # strip spaces
+
+                if [[ "${env_prefix}" == "temp" ]]; then
+                  # Developer/temporary workspaces: give Admin access to both groups
+                  assign_role_to_workspace "${{ ws.name }}" "${{ parameters.devgroup }}" "Admin"
+                  assign_role_to_workspace "${{ ws.name }}" "${{ parameters.admingroup }}" "Admin"
+                elif [[ "${env_prefix}" == "prod" ]]; then
+                  assign_role_to_workspace "${{ ws.name }}" "${{ parameters.devgroup }}" "Member"
+                  assign_role_to_workspace "${{ ws.name }}" "${{ parameters.admingroup }}" "Admin"
+                elif [[ "${env_prefix}" == "main" || "${env_prefix}" == "test" ]]; then
+                  assign_role_to_workspace "${{ ws.name }}" "${{ parameters.devgroup }}" "Admin"
+                  assign_role_to_workspace "${{ ws.name }}" "${{ parameters.admingroup }}" "Admin"
+                fi

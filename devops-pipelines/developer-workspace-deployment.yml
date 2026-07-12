@@ -1,0 +1,931 @@
+# Developer Workspace Deployment Pipeline
+# Purpose: Allow developers to manually create temporary workspaces for feature development
+# Naming: temp-{layer}-{dev-suffix}
+# Example: temp-bronze-john, temp-silver-featureX
+
+trigger: none # Manual trigger only
+pr: none
+
+pool:
+  vmImage: "ubuntu-latest"
+
+parameters:
+  - name: devSuffix
+    type: string
+    displayName: "Developer/Feature Name (suffix)"
+    default: ""
+
+  - name: createBronze
+    type: boolean
+    displayName: "Create Bronze workspace"
+    default: true
+
+  - name: createSilver
+    type: boolean
+    displayName: "Create Silver workspace"
+    default: true
+
+  - name: createGold
+    type: boolean
+    displayName: "Create Gold workspace"
+    default: true
+
+  - name: createLog
+    type: boolean
+    displayName: "Create Log (Observability) workspace"
+    default: false
+
+  - name: createReporting
+    type: boolean
+    displayName: "Create Reporting workspace (semantic models only)"
+    default: true
+
+  - name: createApps
+    type: boolean
+    displayName: "Create App workspaces"
+    default: false
+
+  - name: appsList
+    type: string
+    displayName: "App workspaces to create (comma-separated from apps.yaml, e.g. dq-checks,manual-overrides)"
+    default: ""
+
+  - name: appsReportingSource
+    type: string
+    displayName: "Bind app reports to semantic models in"
+    default: developer
+    values:
+      - developer
+      - main
+
+  - name: shortcutSource
+    type: string
+    displayName: "Shortcut source for Silver/Gold repointing"
+    default: developer
+    values:
+      - developer
+      - main
+
+  - name: gitBranch
+    type: string
+    displayName: "Git branch to sync (leave empty for current branch)"
+    default: "<current>"
+
+  - name: skipWorkspaceCreation
+    type: boolean
+    displayName: "Skip workspace creation (reuse existing workspace)"
+    default: false
+
+variables:
+  - name: serviceConnection
+    value: "svc-azure-terraform-001"
+  - group: vg-platform-global
+  - group: vg-platform-nonprod # Dev workspaces always use nonprod capacity
+  - name: WORKSPACE_PREFIX
+    value: "temp"
+
+stages:
+  - stage: ValidateInputs
+    displayName: "Validate Inputs"
+    jobs:
+      - job: validate
+        displayName: Validate parameters
+        steps:
+          - script: |
+              if [ -z "${{ parameters.devSuffix }}" ]; then
+                echo "##vso[task.logissue type=error]Developer/Feature suffix cannot be empty"
+                exit 1
+              fi
+
+              # Validate suffix contains only allowed characters (alphanumeric and hyphens)
+              if ! echo "${{ parameters.devSuffix }}" | grep -qE '^[a-zA-Z0-9-]+$'; then
+                echo "##vso[task.logissue type=error]Suffix must contain only letters, numbers, and hyphens"
+                exit 1
+              fi
+
+              # Check if at least one layer is selected
+              if [ "${{ parameters.createBronze }}" != "True" ] && \
+                 [ "${{ parameters.createSilver }}" != "True" ] && \
+                 [ "${{ parameters.createGold }}" != "True" ] && \
+                 [ "${{ parameters.createLog }}" != "True" ] && \
+                 [ "${{ parameters.createReporting }}" != "True" ] && \
+                 [ "${{ parameters.createApps }}" != "True" ]; then
+                echo "##vso[task.logissue type=error]At least one layer must be selected"
+                exit 1
+              fi
+
+              echo "Validation passed!"
+              echo "Will create workspaces with suffix: ${{ parameters.devSuffix }}"
+              echo "Bronze: ${{ parameters.createBronze }}"
+              echo "Silver: ${{ parameters.createSilver }}"
+              echo "Gold: ${{ parameters.createGold }}"
+              echo "Log: ${{ parameters.createLog }}"
+              echo "Reporting: ${{ parameters.createReporting }}"
+              echo "Create Apps: ${{ parameters.createApps }}"
+              echo "Apps List: ${{ parameters.appsList }}"
+              echo "Shortcut source mode: ${{ parameters.shortcutSource }}"
+
+              # Validate: if createApps is true, appsList must not be empty
+              if [ "${{ parameters.createApps }}" == "True" ] && [ -z "${{ parameters.appsList }}" ]; then
+                echo "##vso[task.logissue type=error]createApps is enabled but appsList is empty. Specify which apps to deploy (e.g. dq-checks,manual-overrides)"
+                exit 1
+              fi
+
+              # Set git branch variable
+              if [ -z "${{ parameters.gitBranch }}" ] || [ "${{ parameters.gitBranch }}" == "<current>" ]; then
+                BRANCH_NAME="$(Build.SourceBranch)"
+                BRANCH_NAME="${BRANCH_NAME#refs/heads/}"
+              else
+                BRANCH_NAME="${{ parameters.gitBranch }}"
+              fi
+              echo "##vso[task.setvariable variable=GIT_BRANCH;isOutput=true]$BRANCH_NAME"
+              echo "Will sync from branch: $BRANCH_NAME"
+            name: ValidateStep
+            displayName: "Validate inputs and derive branch"
+
+  - stage: CheckWorkspaceExistence
+    dependsOn: ValidateInputs
+    displayName: "Check Workspace Existence"
+    jobs:
+      - job: CheckWorkspaces
+        displayName: Check if workspaces exist
+        steps:
+          - task: AzureCLI@2
+            displayName: "Validate workspace existence against skipWorkspaceCreation flag"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "Getting Fabric access token..."
+                FABRIC_TOKEN="$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)"
+
+                echo "Fetching all workspaces..."
+                WORKSPACES_JSON="$(curl -sS -X GET "https://api.fabric.microsoft.com/v1/workspaces" \
+                  -H "Authorization: Bearer ${FABRIC_TOKEN}" -H "Content-Type: application/json")"
+
+                # Check each selected layer
+                SKIP_CREATION="${{ parameters.skipWorkspaceCreation }}"
+                SUFFIX="${{ parameters.devSuffix }}"
+                BRONZE_SELECTED="${{ parameters.createBronze }}"
+                SILVER_SELECTED="${{ parameters.createSilver }}"
+                GOLD_SELECTED="${{ parameters.createGold }}"
+                LOG_SELECTED="${{ parameters.createLog }}"
+                REPORTING_SELECTED="${{ parameters.createReporting }}"
+                APPS_SELECTED="${{ parameters.createApps }}"
+
+                VALIDATION_FAILED=0
+
+                check_workspace() {
+                  local WS_NAME="$1"
+                  local EXISTS
+                  EXISTS="$(echo "$WORKSPACES_JSON" | jq -r --arg name "$WS_NAME" '.value[] | select(.displayName == $name) | .id')"
+
+                  if [[ -n "$EXISTS" && "$EXISTS" != "null" ]]; then
+                    echo "  ✓ Workspace '$WS_NAME' exists (ID: $EXISTS)"
+                    return 0
+                  else
+                    echo "  ✗ Workspace '$WS_NAME' does NOT exist"
+                    return 1
+                  fi
+                }
+
+                echo ""
+                echo "============================================"
+                echo "Workspace Existence Check"
+                echo "============================================"
+                echo "Skip workspace creation: $SKIP_CREATION"
+                echo "Dev suffix: $SUFFIX"
+                echo ""
+
+                # Check Bronze
+                if [[ "$BRONZE_SELECTED" == "True" ]]; then
+                  WS_NAME="temp-bronze-$SUFFIX"
+                  echo "Checking Bronze workspace: $WS_NAME"
+                  if check_workspace "$WS_NAME"; then
+                    if [[ "$SKIP_CREATION" == "false" ]]; then
+                      echo "  ⚠️  WARNING: Workspace exists but skipWorkspaceCreation=false"
+                      echo "  This may cause creation to fail. Consider setting skipWorkspaceCreation=true"
+                      VALIDATION_FAILED=1
+                    fi
+                  else
+                    if [[ "$SKIP_CREATION" == "true" ]]; then
+                      echo "  ❌ ERROR: Workspace does not exist but skipWorkspaceCreation=true"
+                      echo "  Cannot reuse a workspace that doesn't exist!"
+                      VALIDATION_FAILED=1
+                    fi
+                  fi
+                  echo ""
+                fi
+
+                # Check Silver
+                if [[ "$SILVER_SELECTED" == "True" ]]; then
+                  WS_NAME="temp-silver-$SUFFIX"
+                  echo "Checking Silver workspace: $WS_NAME"
+                  if check_workspace "$WS_NAME"; then
+                    if [[ "$SKIP_CREATION" == "false" ]]; then
+                      echo "  ⚠️  WARNING: Workspace exists but skipWorkspaceCreation=false"
+                      echo "  This may cause creation to fail. Consider setting skipWorkspaceCreation=true"
+                      VALIDATION_FAILED=1
+                    fi
+                  else
+                    if [[ "$SKIP_CREATION" == "true" ]]; then
+                      echo "  ❌ ERROR: Workspace does not exist but skipWorkspaceCreation=true"
+                      echo "  Cannot reuse a workspace that doesn't exist!"
+                      VALIDATION_FAILED=1
+                    fi
+                  fi
+                  echo ""
+                fi
+
+                # Check Gold
+                if [[ "$GOLD_SELECTED" == "True" ]]; then
+                  WS_NAME="temp-gold-$SUFFIX"
+                  echo "Checking Gold workspace: $WS_NAME"
+                  if check_workspace "$WS_NAME"; then
+                    if [[ "$SKIP_CREATION" == "false" ]]; then
+                      echo "  ⚠️  WARNING: Workspace exists but skipWorkspaceCreation=false"
+                      echo "  This may cause creation to fail. Consider setting skipWorkspaceCreation=true"
+                      VALIDATION_FAILED=1
+                    fi
+                  else
+                    if [[ "$SKIP_CREATION" == "true" ]]; then
+                      echo "  ❌ ERROR: Workspace does not exist but skipWorkspaceCreation=true"
+                      echo "  Cannot reuse a workspace that doesn't exist!"
+                      VALIDATION_FAILED=1
+                    fi
+                  fi
+                  echo ""
+                fi
+
+                # Check Log
+                if [[ "$LOG_SELECTED" == "True" ]]; then
+                  WS_NAME="temp-log-$SUFFIX"
+                  echo "Checking Log workspace: $WS_NAME"
+                  if check_workspace "$WS_NAME"; then
+                    if [[ "$SKIP_CREATION" == "false" ]]; then
+                      echo "  ⚠️  WARNING: Workspace exists but skipWorkspaceCreation=false"
+                      echo "  This may cause creation to fail. Consider setting skipWorkspaceCreation=true"
+                      VALIDATION_FAILED=1
+                    fi
+                  else
+                    if [[ "$SKIP_CREATION" == "true" ]]; then
+                      echo "  ❌ ERROR: Workspace does not exist but skipWorkspaceCreation=true"
+                      echo "  Cannot reuse a workspace that doesn't exist!"
+                      VALIDATION_FAILED=1
+                    fi
+                  fi
+                  echo ""
+                fi
+
+                # Check Reporting
+                if [[ "$REPORTING_SELECTED" == "True" ]]; then
+                  WS_NAME="temp-reporting-$SUFFIX"
+                  echo "Checking Reporting workspace: $WS_NAME"
+                  if check_workspace "$WS_NAME"; then
+                    if [[ "$SKIP_CREATION" == "false" ]]; then
+                      echo "  ⚠️  WARNING: Workspace exists but skipWorkspaceCreation=false"
+                      echo "  This may cause creation to fail. Consider setting skipWorkspaceCreation=true"
+                      VALIDATION_FAILED=1
+                    fi
+                  else
+                    if [[ "$SKIP_CREATION" == "true" ]]; then
+                      echo "  ❌ ERROR: Workspace does not exist but skipWorkspaceCreation=true"
+                      echo "  Cannot reuse a workspace that doesn't exist!"
+                      VALIDATION_FAILED=1
+                    fi
+                  fi
+                  echo ""
+                fi
+
+                # Check App workspaces (dynamic from appsList)
+                if [[ "$APPS_SELECTED" == "True" ]]; then
+                  IFS=',' read -ra APP_NAMES <<< "${{ parameters.appsList }}"
+                  for APP_NAME in "${APP_NAMES[@]}"; do
+                    APP_NAME="$(echo "$APP_NAME" | xargs)"  # trim whitespace
+                    WS_NAME="temp-app-${APP_NAME}-$SUFFIX"
+                    echo "Checking App workspace: $WS_NAME"
+                    if check_workspace "$WS_NAME"; then
+                      if [[ "$SKIP_CREATION" == "false" ]]; then
+                        echo "  ⚠️  WARNING: Workspace exists but skipWorkspaceCreation=false"
+                        echo "  This may cause creation to fail. Consider setting skipWorkspaceCreation=true"
+                        VALIDATION_FAILED=1
+                      fi
+                    else
+                      if [[ "$SKIP_CREATION" == "true" ]]; then
+                        echo "  ❌ ERROR: Workspace does not exist but skipWorkspaceCreation=true"
+                        echo "  Cannot reuse a workspace that doesn't exist!"
+                        VALIDATION_FAILED=1
+                      fi
+                    fi
+                    echo ""
+                  done
+                fi
+
+                echo "============================================"
+                if [[ $VALIDATION_FAILED -eq 1 ]]; then
+                  echo "❌ Validation FAILED"
+                  echo "Please check the skipWorkspaceCreation parameter and try again"
+                  exit 1
+                else
+                  echo "✅ Validation PASSED"
+                  echo "Workspace existence matches the skipWorkspaceCreation flag"
+                fi
+                echo "============================================"
+
+  - stage: CreateWorkspace
+    dependsOn: CheckWorkspaceExistence
+    displayName: "Create Developer Workspaces"
+    condition: eq('${{ parameters.skipWorkspaceCreation }}', 'false')
+    jobs:
+      - template: templates/create-workspace.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createReporting, true) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+
+      - ${{ if eq(parameters.createApps, true) }}:
+          - job: CreateAppWorkspaces
+            displayName: "Create App Workspaces"
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: "Create App Workspaces"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_create_workspaces "temp" "${{ parameters.appsList }}" "platform/apps" "${{ parameters.devSuffix }}"
+
+      - job: WaitAfterWorkspace
+        dependsOn: CreateFabricWorkspaces
+        displayName: "Pause for 10 seconds"
+        pool: server
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "10"
+
+  - stage: AssignCapacity
+    dependsOn: CreateWorkspace
+    displayName: "Assign Capacity to Workspaces"
+    condition: eq('${{ parameters.skipWorkspaceCreation }}', 'false')
+    jobs:
+      - template: templates/assign-capacity.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createReporting, true) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+          CapacityIdNonProd: $(capacity_Id_nonprod)
+          CapacityIdProd: ""
+
+      - ${{ if eq(parameters.createApps, true) }}:
+          - job: AssignCapacityToApps
+            displayName: "Assign Capacity to App Workspaces"
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: "Assign Capacity to Apps"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_assign_capacity "temp" "${{ parameters.appsList }}" "platform/apps" "$(capacity_Id_nonprod)" "${{ parameters.devSuffix }}"
+
+      - job: WaitAfterCapacity
+        dependsOn: AssignFabricCapacityToWorkspaces
+        displayName: "Pause for 10 seconds"
+        pool: server
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "10"
+
+  - stage: AddUsersToWorkspace
+    dependsOn: AssignCapacity
+    displayName: "Add Users to Workspaces"
+    condition: |
+      and(
+        in(dependencies.AssignCapacity.result, 'Succeeded', 'Skipped'),
+        eq('${{ parameters.skipWorkspaceCreation }}', 'false')
+      )
+    jobs:
+      - template: templates/add-users.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createReporting, true) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+          devgroup: $(dev_group)
+          admingroup: $(admin_group)
+
+      - ${{ if eq(parameters.createApps, true) }}:
+          - job: AddUsersToApps
+            displayName: "Add Users to App Workspaces"
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: "Add Users to Apps"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_add_users "temp" "${{ parameters.appsList }}" "platform/apps" "$(dev_group)" "$(admin_group)" "${{ parameters.devSuffix }}"
+
+  - stage: GitConnect
+    dependsOn:
+      - ValidateInputs
+      - AddUsersToWorkspace
+    displayName: "Git Connect Workspaces"
+    condition: |
+      and(
+        succeededOrFailed(),
+        eq(dependencies.ValidateInputs.result, 'Succeeded'),
+        ne(dependencies.AddUsersToWorkspace.result, 'Failed')
+      )
+    variables:
+      GIT_BRANCH: $[ stageDependencies.ValidateInputs.validate.outputs['ValidateStep.GIT_BRANCH'] ]
+    jobs:
+      - template: templates/git-connect.yaml
+        parameters:
+          branch: $(GIT_BRANCH)
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createReporting, true) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+
+      - ${{ if eq(parameters.createApps, true) }}:
+          - job: GitConnectApps
+            displayName: "Git Connect App Workspaces"
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: "Git Connect Apps"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    ORG_URL="$(System.TeamFoundationCollectionUri)"
+                    ORG_NAME="$(echo "$ORG_URL" | awk -F'/' '{print $4}')"
+
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_git_connect "temp" "${{ parameters.appsList }}" "platform/apps" \
+                      "$(GIT_BRANCH)" \
+                      "$ORG_NAME" "$(System.TeamProject)" "$(Build.Repository.Name)" \
+                      "ADO-SourceControl-SP" "$(tenantId)" "$(servicePrincipalId)" "$(client_secret)" "${{ parameters.devSuffix }}"
+
+      - job: WaitAfterGitConnect
+        dependsOn: GitConnectToWorkspaces
+        displayName: "Pause for 15 seconds"
+        pool: server
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "15"
+
+  - stage: GitSync
+    dependsOn: GitConnect
+    displayName: "Git Sync to Workspaces"
+    condition: eq(dependencies.GitConnect.result, 'Succeeded')
+    jobs:
+      - template: templates/git-sync.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createReporting, true) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+
+      - ${{ if eq(parameters.createApps, true) }}:
+          - job: GitSyncApps
+            displayName: "Git Sync App Workspaces"
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: "Git Sync Apps"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_git_sync "temp" "${{ parameters.appsList }}" "platform/apps" "${{ parameters.devSuffix }}"
+
+      - job: WaitAfterGitSync
+        dependsOn: GitSyncWorkspaces
+        displayName: "Pause for 30 seconds"
+        pool: server
+        steps:
+          - task: Delay@1
+            inputs:
+              delayForSeconds: "30"
+
+  # These three stages run in PARALLEL after GitSync
+  - stage: PublishEnvironments
+    dependsOn: GitSync
+    displayName: "Publish Fabric Environments"
+    condition: eq(dependencies.GitSync.result, 'Succeeded')
+    jobs:
+      - template: templates/publish-environments.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+
+  - stage: CopyFilesToLakehouses
+    dependsOn: GitSync
+    displayName: "Copy Files to Lakehouses"
+    condition: eq(dependencies.GitSync.result, 'Succeeded')
+    jobs:
+      - template: templates/copyfiles-lakehouse.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+          tenantId: $(tenantId)
+
+  - stage: ApplyShortcuts
+    dependsOn: GitSync
+    displayName: "Apply OneLake Shortcuts (Bronze)"
+    condition: eq(dependencies.GitSync.result, 'Succeeded')
+    jobs:
+      - template: templates/apply-shortcuts.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+          shortcutsFile: "datalake/inputs/config/shortcuts-bronze.yaml"
+
+  # Batch 2: Connect notebooks/models and commit to git (runs in PARALLEL with Batch 1)
+  # These stages are sequential within the batch
+  - stage: ConnectLakehouseToNotebooks
+    dependsOn: GitSync
+    displayName: "Connect Lakehouses to Notebooks"
+    condition: eq(dependencies.GitSync.result, 'Succeeded')
+    jobs:
+      - template: templates/lakehouse-connect-noteb.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+                  lakehouse: "bronze"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+                  lakehouse: "silver"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+                  lakehouse: "gold"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+                  lakehouse: "observability"
+
+  - stage: ConnectSemanticModels
+    dependsOn: ConnectLakehouseToNotebooks
+    displayName: "Connect Semantic Models to SQL Endpoints"
+    condition: eq(dependencies.ConnectLakehouseToNotebooks.result, 'Succeeded')
+    jobs:
+      - template: templates/connect-semantic-models.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+                  lakehouse: "gold"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+                  lakehouse: "observability"
+            - ${{ if and(eq(parameters.createReporting, true), eq(parameters.createGold, true)) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+                  lakehouse: "gold"
+                  lakehouseWorkspace: "temp-gold-${{ parameters.devSuffix }}"
+            - ${{ if and(eq(parameters.createReporting, true), ne(parameters.createGold, true)) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+                  lakehouse: "gold"
+                  lakehouseWorkspace: "main-gold"
+
+  - stage: RepointLakehouseShortcuts
+    dependsOn: ConnectSemanticModels
+    displayName: "Repoint OneLake Shortcuts (Silver/Gold/Log)"
+    condition: eq(dependencies.ConnectSemanticModels.result, 'Succeeded')
+    jobs:
+      - template: templates/update-shortcuts.yaml
+        parameters:
+          mappings:
+            - ${{ if and(eq(parameters.createSilver, true), eq(parameters.shortcutSource, 'developer')) }}:
+                - targetWorkspace: "temp-silver-${{ parameters.devSuffix }}"
+                  targetLakehouse: "silver"
+                  sourceWorkspace: "temp-bronze-${{ parameters.devSuffix }}"
+                  sourceLakehouse: "bronze"
+            - ${{ if and(eq(parameters.createGold, true), eq(parameters.shortcutSource, 'developer')) }}:
+                - targetWorkspace: "temp-gold-${{ parameters.devSuffix }}"
+                  targetLakehouse: "gold"
+                  sourceWorkspace: "temp-silver-${{ parameters.devSuffix }}"
+                  sourceLakehouse: "silver"
+            - ${{ if and(eq(parameters.createLog, true), eq(parameters.shortcutSource, 'developer')) }}:
+                - targetWorkspace: "temp-log-${{ parameters.devSuffix }}"
+                  targetLakehouse: "observability"
+                  sourceWorkspace: "temp-silver-${{ parameters.devSuffix }}"
+                  sourceLakehouse: "silver"
+                  shortcutName: "silver_log"
+                - targetWorkspace: "temp-log-${{ parameters.devSuffix }}"
+                  targetLakehouse: "observability"
+                  sourceWorkspace: "temp-gold-${{ parameters.devSuffix }}"
+                  sourceLakehouse: "gold"
+                  shortcutName: "gold_log"
+                - targetWorkspace: "temp-log-${{ parameters.devSuffix }}"
+                  targetLakehouse: "observability"
+                  sourceWorkspace: "temp-bronze-${{ parameters.devSuffix }}"
+                  sourceLakehouse: "bronze"
+                  shortcutName: "bronze_control"
+            - ${{ if and(eq(parameters.createSilver, true), eq(parameters.shortcutSource, 'main')) }}:
+                - targetWorkspace: "temp-silver-${{ parameters.devSuffix }}"
+                  targetLakehouse: "silver"
+                  sourceWorkspace: "main-bronze"
+                  sourceLakehouse: "bronze"
+            - ${{ if and(eq(parameters.createGold, true), eq(parameters.shortcutSource, 'main')) }}:
+                - targetWorkspace: "temp-gold-${{ parameters.devSuffix }}"
+                  targetLakehouse: "gold"
+                  sourceWorkspace: "main-silver"
+                  sourceLakehouse: "silver"
+            - ${{ if and(eq(parameters.createLog, true), eq(parameters.shortcutSource, 'main')) }}:
+                - targetWorkspace: "temp-log-${{ parameters.devSuffix }}"
+                  targetLakehouse: "observability"
+                  sourceWorkspace: "main-silver"
+                  sourceLakehouse: "silver"
+                  shortcutName: "silver_log"
+                - targetWorkspace: "temp-log-${{ parameters.devSuffix }}"
+                  targetLakehouse: "observability"
+                  sourceWorkspace: "main-gold"
+                  sourceLakehouse: "gold"
+                  shortcutName: "gold_log"
+                - targetWorkspace: "temp-log-${{ parameters.devSuffix }}"
+                  targetLakehouse: "observability"
+                  sourceWorkspace: "main-bronze"
+                  sourceLakehouse: "bronze"
+                  shortcutName: "bronze_control"
+
+  - stage: ConnectPipelineNotebooks
+    dependsOn: ConnectLakehouseToNotebooks
+    displayName: "Repoint Pipeline Notebook References"
+    condition: eq(dependencies.ConnectLakehouseToNotebooks.result, 'Succeeded')
+    jobs:
+      - template: templates/pipeline-connect-noteb.yaml
+        parameters:
+          pipelines:
+            - ${{ if eq(parameters.createLog, true) }}:
+              - workspace: "temp-log-${{ parameters.devSuffix }}"
+                pipeline: "orchestrator"
+                mappings:
+                  - "Bronze=temp-bronze-${{ parameters.devSuffix }}/bronze-orchestrator"
+                  - "Silver=temp-silver-${{ parameters.devSuffix }}/silver-orchestrator"
+                  - "Gold=temp-gold-${{ parameters.devSuffix }}/gold-orchestrator"
+
+  - ${{ if eq(parameters.createApps, true) }}:
+      - stage: RebindReports
+        dependsOn: ConnectSemanticModels
+        displayName: "Rebind Reports to Semantic Models"
+        condition: eq(dependencies.ConnectSemanticModels.result, 'Succeeded')
+        jobs:
+          - job: RebindAppReports
+            displayName: "Rebind App Reports"
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: "Rebind Reports"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    # Determine which environment's semantic models to bind to
+                    if [ "${{ parameters.appsReportingSource }}" == "main" ]; then
+                      SM_PREFIX="main"
+                      SM_SUFFIX=""
+                    else
+                      SM_PREFIX="temp"
+                      SM_SUFFIX="${{ parameters.devSuffix }}"
+                    fi
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_rebind_reports "temp" "${{ parameters.appsList }}" "platform/apps" "$SM_PREFIX" "${{ parameters.devSuffix }}" "$SM_SUFFIX"
+
+  - stage: GitUpdateWorkspace
+    dependsOn:
+      - RepointLakehouseShortcuts
+      - ConnectPipelineNotebooks
+      - ${{ if eq(parameters.createApps, true) }}:
+          - RebindReports
+    displayName: "Git Update (Pull from Remote)"
+    condition: succeededOrFailed()
+    jobs:
+      - template: templates/git-sync.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createReporting, true) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+
+      - ${{ if eq(parameters.createApps, true) }}:
+          - job: GitUpdateApps
+            displayName: "Git Update App Workspaces"
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: "Git Update Apps"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_git_sync "temp" "${{ parameters.appsList }}" "platform/apps" "${{ parameters.devSuffix }}"
+
+  - stage: GitCommitWorkspace
+    dependsOn: GitUpdateWorkspace
+    displayName: "Git Commit To Remote"
+    condition: eq(dependencies.GitUpdateWorkspace.result, 'Succeeded')
+    jobs:
+      - template: templates/git-commit.yaml
+        parameters:
+          workspaces:
+            - ${{ if eq(parameters.createBronze, true) }}:
+                - name: "temp-bronze-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createSilver, true) }}:
+                - name: "temp-silver-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createGold, true) }}:
+                - name: "temp-gold-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createLog, true) }}:
+                - name: "temp-log-${{ parameters.devSuffix }}"
+            - ${{ if eq(parameters.createReporting, true) }}:
+                - name: "temp-reporting-${{ parameters.devSuffix }}"
+
+      - ${{ if eq(parameters.createApps, true) }}:
+          - job: GitCommitApps
+            displayName: "Git Commit App Workspaces"
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: "Git Commit Apps"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_git_commit "temp" "${{ parameters.appsList }}" "platform/apps" "${{ parameters.devSuffix }}"
+
+  # Summary waits for BOTH parallel batches to complete
+  - stage: Summary
+    dependsOn:
+      - PublishEnvironments
+      - CopyFilesToLakehouses
+      - ApplyShortcuts
+      - GitCommitWorkspace
+    displayName: "Deployment Summary"
+    condition: |
+      and(
+        in(dependencies.PublishEnvironments.result, 'Succeeded', 'Skipped'),
+        in(dependencies.CopyFilesToLakehouses.result, 'Succeeded', 'Skipped'),
+        in(dependencies.ApplyShortcuts.result, 'Succeeded', 'Skipped'),
+        eq(dependencies.GitCommitWorkspace.result, 'Succeeded')
+      )
+    jobs:
+      - job: PrintSummary
+        displayName: Print Deployment Summary
+        steps:
+          - checkout: self
+          - script: |
+              echo "============================================"
+              echo "Developer Workspace Deployment Complete!"
+              echo "============================================"
+              echo ""
+              echo "Created workspaces for: ${{ parameters.devSuffix }}"
+              echo ""
+              echo "Workspaces created:"
+            displayName: "Print header"
+
+          - ${{ if eq(parameters.createBronze, true) }}:
+              - script: echo "  ✓ temp-bronze-${{ parameters.devSuffix }}"
+                displayName: "Bronze workspace created"
+
+          - ${{ if eq(parameters.createSilver, true) }}:
+              - script: echo "  ✓ temp-silver-${{ parameters.devSuffix }}"
+                displayName: "Silver workspace created"
+
+          - ${{ if eq(parameters.createGold, true) }}:
+              - script: echo "  ✓ temp-gold-${{ parameters.devSuffix }}"
+                displayName: "Gold workspace created"
+
+          - ${{ if eq(parameters.createLog, true) }}:
+              - script: echo "  ✓ temp-log-${{ parameters.devSuffix }}"
+                displayName: "Log workspace created"
+
+          - ${{ if eq(parameters.createReporting, true) }}:
+              - script: echo "  ✓ temp-reporting-${{ parameters.devSuffix }}"
+                displayName: "Reporting workspace created"
+
+          - ${{ if eq(parameters.createApps, true) }}:
+              - task: AzureCLI@2
+                displayName: "Print App Workspaces"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    chmod +x devops-pipelines/templates/scripts/deploy-apps.sh
+                    source devops-pipelines/templates/scripts/deploy-apps.sh
+                    apps_print_summary "temp" "${{ parameters.appsList }}" "platform/apps" "${{ parameters.devSuffix }}"
+
+          - script: |
+              echo ""
+              echo "Configured with:"
+              echo "  ✓ Capacity assigned (nonprod)"
+              echo "  ✓ Admin and Dev group access"
+              echo "  ✓ Git connected and synced"
+              echo "  ✓ Fabric environments published"
+              echo "  ✓ Lakehouse files copied"
+              echo "  ✓ OneLake shortcuts applied (bronze)"
+              echo "  ✓ OneLake shortcuts repointed from '${{ parameters.shortcutSource }}' source"
+              echo "  ✓ Notebooks connected to lakehouses and environments"
+              echo "  ✓ Semantic models connected to SQL endpoints"
+              echo "  ✓ Reports rebound to semantic models"
+              echo "  ✓ Workspace synced with Git (pulled latest)"
+              echo "  ✓ Workspace metadata committed to Git"
+              echo ""
+              echo "You can now access your workspaces in Microsoft Fabric!"
+              echo "============================================"
+            displayName: "Display summary"

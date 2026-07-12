@@ -1,0 +1,27 @@
+# -----------------------------------------
+# Child template — expects an object list
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+
+jobs:
+  - job: GitSyncWorkspaces
+    displayName: Git Sync To Workspaces
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: "Git Sync To ${{ ws.name }} Workspace"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/gitsync.sh
+                source devops-pipelines/templates/scripts/gitsync.sh
+                fabric_git_initialize_then_update_by_name "${{ ws.name }}"

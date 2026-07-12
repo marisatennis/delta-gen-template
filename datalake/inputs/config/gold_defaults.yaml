@@ -1,0 +1,63 @@
+# Gold Layer Defaults
+# Configuration values for Gold layer Delta-Gen pipelines
+
+# Metrics persistence configuration
+metrics:
+  schema: log
+  prefix: deltagen
+  auto_persist: true
+  log_summary: true
+  partition_by_date: true
+
+# Data quality logging defaults
+dq:
+  rejected_table: log.gold_dq_rejected
+  duplicates_table: log.gold_dq_duplicates
+  unresolved_fks_table: log.gold_dq_unresolved_fks
+  unresolved_records_table: log.gold_dq_unresolved_records
+  log_sample_size: 1000
+
+# Environment settings
+environment: fabric
+
+# Schema list for Gold layer (customize per project)
+schemas:
+  - log
+  - dimension
+  - fact
+
+# Common column defaults
+columns:
+  default_string: "Unknown"
+  default_int: 0
+  default_decimal: 0.0
+  default_date: "1900-01-01"
+
+# Common column templates
+common_columns:
+  source_modified:
+    data_type: date
+    nullable: false
+    default: ${defaults.columns.default_date}
+
+  source_period:
+    data_type: int
+    nullable: false
+    default: ${defaults.columns.default_int}
+
+# Optimization defaults
+optimisation:
+  load_mode: merge
+  merge_strategy: update_changed
+  partition_scheme: null
+
+# Incremental defaults
+incremental:
+  filter_mode: none
+  lookback_days: 0
+
+# FK re-resolution defaults
+fk_reresolution:
+  inputs_path: /lakehouse/default/Files/inputs/gold/fact
+  overrides_table: log.watermark_overrides
+  lookback_days: 90

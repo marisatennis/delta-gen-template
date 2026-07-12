@@ -1,0 +1,34 @@
+# -----------------------------------------
+# Child template — Update OneLake shortcuts (e.g., silver -> bronze)
+# -----------------------------------------
+parameters:
+  - name: mappings
+    type: object
+    default: [] # Each entry: { targetWorkspace, targetLakehouse, sourceWorkspace, sourceLakehouse [, shortcutName] }
+
+jobs:
+  - job: UpdateShortcuts
+    displayName: Update OneLake Shortcuts
+    steps:
+      - checkout: self
+
+      - script: |
+          echo "Installing jq..."
+          sudo apt-get update -qq && sudo apt-get install -y jq
+        displayName: "Install jq"
+
+      - ${{ each map in parameters.mappings }}:
+          - task: AzureCLI@2
+            displayName: "Update shortcuts: ${{ map.targetWorkspace }} -> ${{ map.sourceWorkspace }}"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/update-shortcuts.sh
+                source devops-pipelines/templates/scripts/update-shortcuts.sh
+                fabric_update_shortcuts_to_lakehouse \
+                  "${{ map.targetWorkspace }}" "${{ map.targetLakehouse }}" \
+                  "${{ map.sourceWorkspace }}" "${{ map.sourceLakehouse }}" \
+                  "${{ coalesce(map.shortcutName, '') }}"

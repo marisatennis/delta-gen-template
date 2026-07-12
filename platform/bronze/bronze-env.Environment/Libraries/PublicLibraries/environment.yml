@@ -1,0 +1,4 @@
+dependencies:
+  - pip:
+      - pydantic==2.12.5
+      - simple-salesforce==1.12.9

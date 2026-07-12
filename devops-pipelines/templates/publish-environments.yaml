@@ -1,0 +1,28 @@
+# -----------------------------------------
+# Child template — Publish all Fabric Environments in workspaces
+# Always attempts publish - API is idempotent (returns 200 if nothing to publish)
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+
+jobs:
+  - job: PublishEnvironments
+    displayName: Publish Environments in Workspaces
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: "Publish Environments in ${{ ws.name }}"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/publish-environments.sh
+                source devops-pipelines/templates/scripts/publish-environments.sh
+                fabric_publish_environments_by_workspace_name "${{ ws.name }}"

@@ -1,0 +1,40 @@
+# -----------------------------------------
+# Child template — expects an object list
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+  - name: tenantId
+    type: string
+    default: $(tenantId)
+
+jobs:
+  - job: CopyFilesToLakehouses
+    displayName: Copy Files to Workspaces
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: "Copy Files To ${{ ws.name }} Lakehouse"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                export AZCOPY_AUTO_LOGIN_TYPE=AZCLI
+                export AZCOPY_TENANT_ID="${{ parameters.tenantId }}"
+                chmod +x devops-pipelines/templates/scripts/copyfilestoLH.sh
+                source devops-pipelines/templates/scripts/copyfilestoLH.sh
+
+                result="$(echo "${{ ws.name }}" | cut -d'-' -f2)"
+
+                fabric_upload_local_folder_to_onelake \
+                    "${{ ws.name }}" \
+                    "$result" \
+                    "/datalake" \
+                    "/" \
+                    --use-abfs=true

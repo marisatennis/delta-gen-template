@@ -1,0 +1,117 @@
+# Gold Date Dimension
+# Generated date dimension covering a configurable range.
+
+name: d_date
+layer: gold
+target_schema: dimension
+description: "Date dimension with calendar attributes"
+
+policies:
+  orchestration:
+    active: true
+    batch: 0
+    order: 1
+  creation:
+    notebook_name: gold-template
+  optimisation:
+    load_mode: merge
+    merge_strategy: insert_only
+
+natural_key:
+  - DateNaturalID
+
+sources:
+  - name: generated
+    generated: true
+
+columns:
+  - name: DateID
+    data_type: string
+    nullable: false
+    inputs:
+      - expression: "md5(CAST(date_value AS STRING))"
+
+  - name: DateNaturalID
+    data_type: string
+    nullable: false
+    inputs:
+      - expression: "CAST(date_value AS STRING)"
+
+  - name: FullDate
+    data_type: date
+    nullable: false
+    inputs:
+      - expression: "date_value"
+
+  - name: DayOfWeek
+    data_type: int
+    nullable: false
+    inputs:
+      - expression: "dayofweek(date_value)"
+
+  - name: DayName
+    data_type: string
+    nullable: false
+    inputs:
+      - expression: "date_format(date_value, 'EEEE')"
+
+  - name: DayOfMonth
+    data_type: int
+    nullable: false
+    inputs:
+      - expression: "day(date_value)"
+
+  - name: MonthNumber
+    data_type: int
+    nullable: false
+    inputs:
+      - expression: "month(date_value)"
+
+  - name: MonthName
+    data_type: string
+    nullable: false
+    inputs:
+      - expression: "date_format(date_value, 'MMMM')"
+
+  - name: Quarter
+    data_type: int
+    nullable: false
+    inputs:
+      - expression: "quarter(date_value)"
+
+  - name: Year
+    data_type: int
+    nullable: false
+    inputs:
+      - expression: "year(date_value)"
+
+  - name: YearMonth
+    data_type: string
+    nullable: false
+    inputs:
+      - expression: "date_format(date_value, 'yyyy-MM')"
+
+  - name: IsWeekend
+    data_type: boolean
+    nullable: false
+    inputs:
+      - expression: "CASE WHEN dayofweek(date_value) IN (1, 7) THEN true ELSE false END"
+
+  - name: source_modified
+    data_type: date
+    nullable: false
+    default: "1900-01-01"
+    inputs:
+      - expression: "current_date()"
+
+stages:
+  - name: add_sentinels
+    extensions:
+      stage_plugin: ensure_sentinels
+      records:
+        - DateID: "NO_DATE"
+          DateNaturalID: "1900-01-01"
+          FullDate: "1900-01-01"
+          DayName: "!! Unknown"
+          MonthName: "!! Unknown"
+          Year: 1900

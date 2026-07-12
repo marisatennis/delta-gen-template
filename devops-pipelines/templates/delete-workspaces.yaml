@@ -1,0 +1,60 @@
+# delete-workspaces.yaml
+# Reusable template for deleting Fabric workspaces
+# Used by: developer-workspace-cleanup.yml, automated-temp-workspace-cleanup.yml
+
+parameters:
+  - name: serviceConnection
+    type: string
+  - name: mode
+    type: string
+    default: 'byNames'  # 'byNames' or 'byJson'
+    values:
+      - byNames
+      - byJson
+  - name: workspaceNames
+    type: object
+    default: []
+  - name: workspacesJson
+    type: string
+    default: '[]'
+  - name: continueOnError
+    type: boolean
+    default: true
+
+steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: Delete workspaces
+    continueOnError: ${{ parameters.continueOnError }}
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        
+        # Source the reusable functions
+        chmod +x devops-pipelines/templates/scripts/delete-workspaces.sh
+        source devops-pipelines/templates/scripts/delete-workspaces.sh
+        
+        # Get access token
+        ACCESS_TOKEN=$(get_access_token)
+        
+        MODE="${{ parameters.mode }}"
+        
+        if [ "$MODE" == "byNames" ]; then
+          # Delete by workspace names
+          WORKSPACE_NAMES=(${{ join(' ', parameters.workspaceNames) }})
+          
+          if [ ${#WORKSPACE_NAMES[@]} -eq 0 ]; then
+            echo "No workspace names provided. Nothing to delete."
+            exit 0
+          fi
+          
+          delete_workspaces_by_names "$ACCESS_TOKEN" "${WORKSPACE_NAMES[@]}"
+        else
+          # Delete from JSON list
+          WORKSPACES_JSON='${{ parameters.workspacesJson }}'
+          delete_workspaces_from_json "$ACCESS_TOKEN" "$WORKSPACES_JSON"
+        fi

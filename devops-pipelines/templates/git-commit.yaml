@@ -1,0 +1,27 @@
+# -----------------------------------------
+# Child template — expects an object list
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+
+jobs:
+  - job: GitCommitWorkspaces
+    displayName: Git Commit To Workspaces
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: "Git Commit To ${{ ws.name }} Workspace"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/git-commit.sh
+                source devops-pipelines/templates/scripts/git-commit.sh
+                commit_fabric_workspace_to_git "${{ ws.name }}" "Git Commit from DevOps Pipeline" "false"

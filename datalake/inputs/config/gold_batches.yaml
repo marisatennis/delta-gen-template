@@ -1,0 +1,32 @@
+# Gold batch schedule configuration
+# Orchestrator filters batches by run_schedule (daily/weekly/monthly/etc)
+
+batches:
+  "0":
+    name: initialization
+    description: "Static reference tables (d_date, etc.) - only runs if tables are missing"
+    schedules: []
+    active: true
+
+  "1":
+    name: dimensions
+    schedules:
+      - daily
+      - all
+    active: true
+
+  "2":
+    name: facts
+    schedules:
+      - daily
+      - all
+    active: true
+
+  "3":
+    name: month_end_facts
+    schedules:
+      - monthly
+      - all
+    days_of_month: [1]
+    hours_utc: [4]
+    active: true

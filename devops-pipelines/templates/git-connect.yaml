@@ -1,0 +1,57 @@
+# -----------------------------------------
+# Child template — expects an object list
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+  - name: branch
+    type: string
+    default: "$(Build.SourceBranchName)"
+
+jobs:
+  - job: GitConnectToWorkspaces
+    displayName: Git Connect To Workspaces
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: "Git Connect To ${{ ws.name }} Workspace"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                ORG_URL="$(System.TeamFoundationCollectionUri)"
+                ORG_NAME="$(echo "$ORG_URL" | awk -F'/' '{print $4}')"
+
+                chmod +x devops-pipelines/templates/scripts/gitconnect.sh
+                source devops-pipelines/templates/scripts/gitconnect.sh
+
+
+                # Use explicit directory if provided, otherwise derive from workspace name
+                EXPLICIT_DIR="${{ coalesce(ws.directory, '') }}"
+                if [[ -n "$EXPLICIT_DIR" ]]; then
+                  directory_name="$EXPLICIT_DIR"
+                else
+                  result=$(echo "${{ ws.name }}" | cut -d'-' -f2)
+                  directory="platform/"
+                  directory_name="${directory}${result}"
+                fi
+                echo "Git directory: $directory_name"
+
+                fabric_git_connect_ado_id \
+                  --workspace-name "${{ ws.name }}" \
+                  --conn-name "ADO-SourceControl-SP" \
+                  --ado-sp-tenant "$(tenantId)" \
+                  --ado-sp-client-id "$(servicePrincipalId)" \
+                  --ado-sp-secret "$(client_secret)" \
+                  --org "$ORG_NAME" \
+                  --project "$(System.TeamProject)" \
+                  --repo "$(Build.Repository.Name)" \
+                  --branch "${{ parameters.branch }}" \
+                  --directory "$directory_name" \
+                  --ado-repo-url "https://dev.azure.com/$ORG_NAME/$(System.TeamProject)/_git/$(Build.Repository.Name)"

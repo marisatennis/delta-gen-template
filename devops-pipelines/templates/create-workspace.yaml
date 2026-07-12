@@ -1,0 +1,27 @@
+# -----------------------------------------
+# Child template — expects an object list
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: []
+
+jobs:
+  - job: CreateFabricWorkspaces
+    displayName: Create Fabric Workspaces
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: Create ${{ ws.name }} Workspace
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/createws.sh
+                source devops-pipelines/templates/scripts/createws.sh
+                create_workspace "${{ ws.name }}" "Created by SPN"

@@ -1,0 +1,36 @@
+# -----------------------------------------
+# Child template — Connect semantic models to lakehouse SQL endpoints
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+
+jobs:
+  - job: ConnectSemanticModelsToLakehouses
+    displayName: Connect Semantic Models To Lakehouse SQL Endpoints
+    steps:
+      - checkout: self
+
+      # Loop over each workspace entry
+      - ${{ each ws in parameters.workspaces }}:
+          - task: AzureCLI@2
+            displayName: "Connect Semantic Models in ${{ ws.name }}"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/connect-semantic-models.sh
+                source devops-pipelines/templates/scripts/connect-semantic-models.sh
+
+                echo "[INFO] Connecting semantic models in workspace: ${{ ws.name }}"
+                echo "[INFO] Using lakehouse: ${{ ws.lakehouse }}"
+                echo "[INFO] Lakehouse workspace: ${{ coalesce(ws.lakehouseWorkspace, ws.name) }}"
+
+                # 3rd arg is the workspace that owns the lakehouse (defaults to same workspace)
+                fabric_connect_semantic_models_to_lakehouse \
+                  "${{ ws.name }}" \
+                  "${{ ws.lakehouse }}" \
+                  "${{ coalesce(ws.lakehouseWorkspace, ws.name) }}"

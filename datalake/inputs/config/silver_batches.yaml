@@ -1,0 +1,44 @@
+# Silver batch schedule configuration
+# Orchestrator filters batches by run_schedule (daily/weekly/monthly/etc)
+
+batches:
+  "0":
+    name: initialization
+    description: "Seed tables - only runs if tables are missing"
+    schedules: []
+    active: true
+
+  "1":
+    name: daily_core
+    schedules:
+      - daily
+      - all
+    days_of_week: ["mon", "tue", "wed", "thu", "fri"]
+    hours_utc: [2]
+    active: true
+
+  "2":
+    name: weekly_refresh
+    schedules:
+      - weekly
+      - all
+    days_of_week: ["sat"]
+    hours_utc: [3]
+    active: true
+
+  "3":
+    name: month_end
+    schedules:
+      - monthly
+      - all
+    days_of_month: [1]
+    hours_utc: [4]
+    active: true
+
+  "4":
+    name: staging_and_enrichment
+    schedules:
+      - weekly
+      - monthly
+      - all
+    active: true

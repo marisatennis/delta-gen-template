@@ -1,0 +1,68 @@
+# Silver Layer Defaults
+# Configuration values for Silver layer Delta-Gen pipelines
+
+# Metrics persistence configuration
+metrics:
+  schema: log
+  prefix: deltagen
+  auto_persist: true
+  log_summary: true
+  partition_by_date: true
+
+# Data quality logging defaults
+dq:
+  rejected_table: log.silver_dq_rejected
+  duplicates_table: log.silver_dq_duplicates
+  log_sample_size: 1000
+
+# Environment settings
+environment: fabric
+
+# Schema list for Silver layer.
+#
+# Two common patterns:
+#   (a) Single catchall:  `silver` schema for every Silver table.
+#   (b) By source type:   one schema per source (sharepoint, salesforce, adls, ...)
+#                          to match the inputs/silver/<source>/ subdir layout.
+#
+# Pattern (b) (uncomment if you want it) is closer to how a typical production
+# Fabric platform organises tables.
+schemas:
+  - silver
+  - log
+  - staging
+  # - sharepoint
+  # - salesforce
+  # - adls
+  # - transform
+  # - mapping
+
+# Common column defaults
+columns:
+  default_string: "Unknown"
+  default_int: 0
+  default_decimal: 0.0
+  default_date: "1900-01-01"
+
+# Common column templates (auto-applied by Delta-Gen when names match)
+common_columns:
+  source_modified:
+    data_type: date
+    nullable: false
+    default: ${defaults.columns.default_date}
+
+  source_period:
+    data_type: int
+    nullable: true
+    default: ${defaults.columns.default_int}
+
+# Optimization defaults
+optimisation:
+  load_mode: merge
+  merge_strategy: update_changed
+  partition_scheme: null
+
+# Incremental defaults
+incremental:
+  filter_mode: none
+  lookback_days: 0

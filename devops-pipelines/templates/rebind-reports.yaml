@@ -1,0 +1,35 @@
+# -----------------------------------------
+# Child template — Rebind reports to semantic models (cross-workspace)
+# -----------------------------------------
+parameters:
+  - name: reports
+    type: object
+    default: [] # Parent will supply the list
+
+jobs:
+  - job: RebindReportsToSemanticModels
+    displayName: Rebind Reports To Semantic Models
+    steps:
+      - checkout: self
+
+      # Loop over each report workspace entry
+      - ${{ each rpt in parameters.reports }}:
+          - task: AzureCLI@2
+            displayName: "Rebind reports in ${{ rpt.reportWorkspace }} to ${{ rpt.semanticModelName }}"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                chmod +x devops-pipelines/templates/scripts/rebind-reports.sh
+                source devops-pipelines/templates/scripts/rebind-reports.sh
+
+                echo "[INFO] Rebinding reports in workspace: ${{ rpt.reportWorkspace }}"
+                echo "[INFO] Target semantic model: ${{ rpt.semanticModelName }}"
+                echo "[INFO] Semantic model workspace: ${{ rpt.semanticModelWorkspace }}"
+
+                fabric_rebind_reports \
+                  "${{ rpt.reportWorkspace }}" \
+                  "${{ rpt.semanticModelWorkspace }}" \
+                  "${{ rpt.semanticModelName }}"

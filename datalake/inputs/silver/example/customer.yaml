@@ -1,0 +1,102 @@
+# Example Silver Layer Table Configuration
+# This is a template showing common patterns for silver-layer tables.
+
+name: customer
+layer: silver
+target_schema: silver
+description: "Customer master data from source system"
+
+# Orchestration settings
+policies:
+  orchestration:
+    active: true
+    batch: 1
+    order: 10
+
+  creation:
+    notebook_name: silver-template
+
+  optimisation:
+    load_mode: merge
+    merge_strategy: update_changed
+    hash_columns:
+      - customer_name
+      - email
+      - phone
+      - city
+      - country
+
+# Source tables
+sources:
+  - name: src
+    table: bronze.raw_customers
+
+# Incremental loading (watermark-based)
+incremental:
+  filter_mode: watermark
+  watermark_column: LastModifiedDate
+  source_watermark_column: LastModifiedDate
+
+# Natural key for merge operations
+natural_key:
+  - customer_id
+
+# Column definitions
+columns:
+  - name: customer_id
+    data_type: string
+    nullable: false
+    inputs:
+      - source: src
+        column: id
+
+  - name: customer_name
+    data_type: string
+    nullable: false
+    default: ${defaults.columns.default_string}
+    inputs:
+      - source: src
+        column: name
+
+  - name: email
+    data_type: string
+    nullable: true
+    inputs:
+      - source: src
+        column: email_address
+
+  - name: phone
+    data_type: string
+    nullable: true
+    inputs:
+      - source: src
+        column: phone_number
+
+  - name: city
+    data_type: string
+    nullable: true
+    inputs:
+      - source: src
+        column: city
+
+  - name: country
+    data_type: string
+    nullable: true
+    inputs:
+      - source: src
+        column: country_code
+
+  - name: is_active
+    data_type: boolean
+    nullable: false
+    default: true
+    inputs:
+      - expression: "CASE WHEN src.status = 'ACTIVE' THEN true ELSE false END"
+
+  - name: source_modified
+    data_type: date
+    nullable: false
+    default: ${defaults.columns.default_date}
+    inputs:
+      - source: src
+        column: LastModifiedDate

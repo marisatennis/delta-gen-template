@@ -1,0 +1,38 @@
+# -----------------------------------------
+# Child template — Apply OneLake shortcuts to Bronze lakehouse
+# Shortcuts are only applied to bronze layer (data sources)
+# -----------------------------------------
+parameters:
+  - name: workspaces
+    type: object
+    default: [] # Parent will supply the list
+  - name: shortcutsFile
+    type: string
+    default: 'datalake/inputs/config/shortcuts-bronze.yaml'
+
+jobs:
+  - job: ApplyShortcuts
+    displayName: Apply Shortcuts to Bronze Lakehouses
+    steps:
+      - checkout: self
+
+      # Install jq (required by shortcuts script)
+      - script: |
+          echo "Installing jq..."
+          sudo apt-get update -qq && sudo apt-get install -y jq
+        displayName: 'Install jq'
+
+      # Loop over each workspace entry - only apply to bronze workspaces
+      - ${{ each ws in parameters.workspaces }}:
+          - ${{ if contains(ws.name, 'bronze') }}:
+              - task: AzureCLI@2
+                displayName: "Apply Shortcuts to ${{ ws.name }}"
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    chmod +x devops-pipelines/templates/scripts/apply-shortcuts.sh
+                    source devops-pipelines/templates/scripts/apply-shortcuts.sh
+                    fabric_apply_shortcuts_by_workspace_name "${{ ws.name }}" "bronze" "${{ parameters.shortcutsFile }}"
