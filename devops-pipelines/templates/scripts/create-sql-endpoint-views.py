@@ -607,9 +607,9 @@ FROM [bronze_control].[sharepoint_list_delta_state]
 
 def main():
     """Main entry point."""
-    # Observability lakehouse SQL endpoint details
-    SERVER = "bvsrb7ksrrmeljqi6ly3qjj5x4-opjgncvnr2vurgejlals35bszy.datawarehouse.fabric.microsoft.com"
-    DATABASE = "5b4dfb4b-f8be-4194-b871-ddd6a8f59098"  # observability lakehouse ID
+    # Observability lakehouse SQL endpoint details: set these for your environment
+    SERVER = "xxx.datawarehouse.fabric.microsoft.com"  # observability SQL endpoint
+    DATABASE = "00000000-0000-0000-0000-000000000000"  # observability lakehouse ID
 
     print("=" * 80)
     print("Creating SQL Analytics Endpoint Views for Observability Lakehouse")

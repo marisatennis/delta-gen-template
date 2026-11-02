@@ -61,7 +61,7 @@
         ],
         "expression": [
           "let",
-          "    database = Sql.Database(\"TZVK5NQY63UUNNMWQVLZZWHS3Y-HBB5SDEMLK2UREP2YMOBIWR6XU.datawarehouse.fabric.microsoft.com\", \"1eb650e3-7819-4a9c-b947-43b42af5c1f1\")",
+          "    database = Sql.Database(\"xxx.datawarehouse.fabric.microsoft.com\", \"00000000-0000-0000-0000-000000000000\")",
           "in",
           "    database"
         ],
