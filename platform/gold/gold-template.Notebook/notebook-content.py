@@ -234,9 +234,6 @@ try:
             except Exception as fk_err:
                 print(f"  FK re-resolution check skipped: {fk_err}")
 
-    if FULL_LOAD:
-        spark.sql(f"DROP TABLE IF EXISTS {target_table}")
-
     builder = PlanBuilder(config)
     df = builder.build(spark, debug=DEBUG, context=ctx, watermark_override=effective_watermark)
 
@@ -251,7 +248,12 @@ try:
         notebookutils.notebook.exit(">>> EXIT NOTEBOOK: No new records to process")
 
     if FULL_LOAD:
-        df.write.format("delta").mode("overwrite").saveAsTable(target_table)
+        # Delta overwrite commits the replacement through the transaction log.
+        # Never DROP first: a transform/write failure must leave the previous
+        # table and its SQL endpoint metadata queryable.
+        df.write.format("delta").mode("overwrite").option(
+            "overwriteSchema", "true"
+        ).saveAsTable(target_table)
         ctx.metrics.record_write(
             target_table=target_table,
             write_mode="overwrite",
